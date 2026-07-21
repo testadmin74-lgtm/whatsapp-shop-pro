@@ -1,10 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Plus, Edit2, Trash2, Copy, Check, Image as ImageIcon, X, Package, Settings, Home, Eye, ShoppingBag, Receipt, Power, Star, Tag, BarChart3, ImagePlus, Megaphone } from "lucide-react";
-import { addProduct, editProduct, deleteProduct, updateMerchantSettings, toggleStoreStatus, toggleFeatured, updateOrderStatus, addPromoCode, deletePromoCode, updateStoreBanner, addProductVariant, deleteProductVariant } from "@/lib/actions";
+import { Plus, Edit2, Trash2, Copy, Check, Image as ImageIcon, X, Package, Settings, Home, Eye, ShoppingBag, Receipt, Power, Star, Tag, BarChart3, ImagePlus, Megaphone, BellRing, Download, FileText } from "lucide-react";
+import { addProduct, editProduct, deleteProduct, updateMerchantSettings, toggleStoreStatus, toggleFeatured, updateOrderStatus, addPromoCode, deletePromoCode, updateStoreBanner, addProductVariant, deleteProductVariant, getMerchantOrders } from "@/lib/actions";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
 
 type VariantType = {
   id: string;
@@ -20,6 +22,8 @@ type ProductType = {
   imageUrl: string;
   category: string;
   isFeatured: boolean;
+  trackStock: boolean;
+  stockCount: number;
   variants?: VariantType[];
 };
 
@@ -57,20 +61,62 @@ type MerchantType = {
   subscriptionTier: string;
   coverImageUrl?: string | null;
   welcomeMessage?: string | null;
+  customDomain?: string | null;
+  deliveryFee: number;
+  freeDeliveryThreshold?: number | null;
   products: ProductType[];
   orders?: OrderType[];
   promos?: PromoType[];
 };
 
-export default function MerchantClient({ merchant, globalAnnouncement }: { merchant: MerchantType | null, globalAnnouncement: string }) {
+export default function Dashboard({
+  merchant,
+  globalAnnouncement,
+  role
+}: {
+  merchant: MerchantType | null;
+  globalAnnouncement: string;
+  role?: string;
+}) {
   const [activeTab, setActiveTab] = useState("home");
   const [products, setProducts] = useState(merchant?.products || []);
+  const [orders, setOrders] = useState<OrderType[]>(merchant?.orders || []);
+  const [showNotification, setShowNotification] = useState(false);
+  const prevOrderCountRef = useRef(merchant?.orders?.length || 0);
   const [copied, setCopied] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [isInstallable, setIsInstallable] = useState(false);
+  const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
   
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingProduct, setEditingProduct] = useState<ProductType | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
+
+  const handleDownloadReceipt = (order: OrderType) => {
+    const doc = new jsPDF();
+    doc.setFontSize(20);
+    doc.text(`Receipt - ${merchant?.name}`, 14, 22);
+    doc.setFontSize(12);
+    doc.text(`Order ID: ${order.id}`, 14, 32);
+    doc.text(`Customer: ${order.customerName}`, 14, 40);
+    doc.text(`Date: ${new Date(order.createdAt).toLocaleString()}`, 14, 48);
+
+    const tableData = order.items.map(item => [
+      item.productName,
+      item.quantity.toString(),
+      `Rs. ${item.price}`
+    ]);
+
+    autoTable(doc, {
+      startY: 55,
+      head: [['Item', 'Qty', 'Price']],
+      body: tableData,
+    });
+
+    const finalY = (doc as any).lastAutoTable.finalY || 55;
+    doc.text(`Total: Rs. ${order.totalAmount}`, 14, finalY + 10);
+    doc.save(`Receipt_${order.id.substring(0,6)}.pdf`);
+  };
 
   if (merchant && merchant.products !== products && !loading) {
       setProducts(merchant.products);
@@ -83,7 +129,59 @@ export default function MerchantClient({ merchant, globalAnnouncement }: { merch
   const isFreeTier = merchant.subscriptionTier === "Free";
   const isLimitReached = isFreeTier && products.length >= 10;
 
-  const orders = merchant.orders || [];
+  // Poll for new orders every 10 seconds
+  useEffect(() => {
+    if (!merchant) return;
+    const interval = setInterval(async () => {
+      const res = await getMerchantOrders(merchant.id);
+      if (res.orders) {
+        setOrders(res.orders);
+        if (res.orders.length > prevOrderCountRef.current) {
+          // New Order Arrived!
+          setShowNotification(true);
+          setTimeout(() => setShowNotification(false), 5000);
+          try {
+            const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.type = "sine";
+            osc.frequency.value = 800;
+            gain.gain.setValueAtTime(0, ctx.currentTime);
+            gain.gain.linearRampToValueAtTime(1, ctx.currentTime + 0.05);
+            gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+            osc.start(ctx.currentTime);
+            osc.stop(ctx.currentTime + 0.5);
+          } catch (e) {} // Ignore if browser blocks audio without interaction
+        }
+        prevOrderCountRef.current = res.orders.length;
+      }
+    }, 10000);
+
+    const handleBeforeInstallPrompt = (e: any) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+      setIsInstallable(true);
+    };
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    };
+  }, [merchant]);
+
+  const handleInstallApp = async () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    const { outcome } = await deferredPrompt.userChoice;
+    if (outcome === 'accepted') {
+      setIsInstallable(false);
+    }
+    setDeferredPrompt(null);
+  };
+
   const promos = merchant.promos || [];
   const totalRevenue = orders.filter(o => o.status === "Completed").reduce((sum, o) => sum + o.totalAmount, 0);
 
@@ -93,7 +191,7 @@ export default function MerchantClient({ merchant, globalAnnouncement }: { merch
     Revenue: o.totalAmount
   })).reverse();
 
-  const storeLink = `localhost:3000/${merchant.slug}`;
+  const storeLink = `${window.location.host}/${merchant.slug}`;
 
   const handleCopyLink = () => {
     navigator.clipboard.writeText(storeLink);
@@ -209,11 +307,31 @@ export default function MerchantClient({ merchant, globalAnnouncement }: { merch
   // --- VIEWS ---
 
   const renderHomeView = () => (
-    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="p-4 space-y-6 pb-28">
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="p-4 space-y-6 pb-36">
       {globalAnnouncement && (
         <div className="bg-indigo-600 text-white p-4 rounded-2xl shadow-lg flex items-start space-x-3">
           <Megaphone className="w-5 h-5 shrink-0 mt-0.5" />
           <div className="text-sm font-medium">{globalAnnouncement}</div>
+        </div>
+      )}
+
+      {isInstallable && (
+        <div className="bg-gradient-to-r from-blue-500 to-indigo-600 text-white p-4 rounded-3xl shadow-lg flex items-center justify-between">
+          <div className="flex items-center space-x-3">
+            <div className="bg-white/20 p-2 rounded-xl">
+              <Download className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <div className="font-black">Install Dashboard App</div>
+              <div className="text-xs font-medium text-blue-100">For faster access</div>
+            </div>
+          </div>
+          <button 
+            onClick={handleInstallApp}
+            className="bg-white text-indigo-600 px-4 py-2 rounded-xl font-bold text-sm shadow-sm hover:scale-105 transition-transform"
+          >
+            Install
+          </button>
         </div>
       )}
 
@@ -259,35 +377,11 @@ export default function MerchantClient({ merchant, globalAnnouncement }: { merch
           )}
         </div>
       </div>
-
-      <div className="bg-white rounded-3xl p-5 shadow-sm border border-slate-100 flex flex-col items-center text-center">
-        <div className="w-32 h-32 bg-slate-100 rounded-2xl flex items-center justify-center mb-4 overflow-hidden border-2 border-indigo-100 p-2">
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=http://${storeLink}`} alt="Store QR Code" className="w-full h-full object-contain" />
-        </div>
-        <h3 className="font-bold text-slate-900 text-lg mb-2">Your Store QR Code</h3>
-        <p className="text-sm text-slate-500 mb-4">Print this and paste it on your counter.</p>
-        
-        <div className="bg-slate-50 border border-slate-200 rounded-xl p-1.5 flex items-center w-full">
-          <div className="px-3 text-sm font-medium text-slate-600 truncate flex-1 text-left">
-            {storeLink}
-          </div>
-          <button 
-            onClick={handleCopyLink}
-            className={`px-4 py-2 rounded-lg text-sm font-bold flex items-center space-x-1.5 transition-colors ${
-              copied ? 'bg-green-100 text-green-700' : 'bg-indigo-600 text-white hover:bg-indigo-700'
-            }`}
-          >
-            {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-            <span>{copied ? 'Copied' : 'Copy'}</span>
-          </button>
-        </div>
-      </div>
     </motion.div>
   );
 
   const renderProductsView = () => (
-    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="p-4 space-y-6 pb-28">
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="p-4 space-y-6 pb-36">
       <div className="flex justify-between items-center mb-4">
         <h2 className="font-black text-slate-900 text-lg">My Products</h2>
         <span className="bg-slate-200 text-slate-700 text-xs font-bold px-2.5 py-1 rounded-full">{products.length} Items</span>
@@ -351,7 +445,7 @@ export default function MerchantClient({ merchant, globalAnnouncement }: { merch
   );
 
   const renderOrdersView = () => (
-    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="p-4 space-y-6 pb-28">
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="p-4 space-y-6 pb-36">
       <div className="flex justify-between items-center mb-4">
         <h2 className="font-black text-slate-900 text-lg">Live Orders</h2>
         <span className="bg-slate-200 text-slate-700 text-xs font-bold px-2.5 py-1 rounded-full">{orders.length} Total</span>
@@ -374,21 +468,26 @@ export default function MerchantClient({ merchant, globalAnnouncement }: { merch
                 </div>
                 <div className="text-right">
                   <div className="font-black text-green-600 mb-2">Rs. {order.totalAmount}</div>
-                  <select 
-                    value={order.status}
-                    onChange={(e) => handleStatusChange(order.id, e.target.value)}
-                    className={`text-xs font-bold px-2 py-1 rounded-lg border-2 focus:outline-none ${
-                      order.status === 'Pending' ? 'bg-orange-50 border-orange-200 text-orange-600' :
-                      order.status === 'Preparing' ? 'bg-blue-50 border-blue-200 text-blue-600' :
-                      order.status === 'Out for Delivery' ? 'bg-purple-50 border-purple-200 text-purple-600' :
-                      'bg-green-50 border-green-200 text-green-600'
-                    }`}
-                  >
-                    <option value="Pending">Pending</option>
-                    <option value="Preparing">Preparing</option>
-                    <option value="Out for Delivery">Delivery</option>
-                    <option value="Completed">Completed</option>
-                  </select>
+                  <div className="flex items-center">
+                    <select 
+                      value={order.status}
+                      onChange={(e) => handleStatusChange(order.id, e.target.value)}
+                      className={`text-xs font-bold px-2 py-1 rounded-lg border-2 focus:outline-none ${
+                        order.status === 'Pending' ? 'bg-orange-50 border-orange-200 text-orange-600' :
+                        order.status === 'Preparing' ? 'bg-blue-50 border-blue-200 text-blue-600' :
+                        order.status === 'Out for Delivery' ? 'bg-purple-50 border-purple-200 text-purple-600' :
+                        'bg-green-50 border-green-200 text-green-600'
+                      }`}
+                    >
+                      <option value="Pending">Pending</option>
+                      <option value="Preparing">Preparing</option>
+                      <option value="Out for Delivery">Delivery</option>
+                      <option value="Completed">Completed</option>
+                    </select>
+                    <button onClick={() => handleDownloadReceipt(order)} className="bg-slate-200 text-slate-700 p-1.5 rounded-lg ml-2">
+                        <FileText className="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
               </div>
               <div className="space-y-1">
@@ -399,10 +498,6 @@ export default function MerchantClient({ merchant, globalAnnouncement }: { merch
                   </div>
                 ))}
               </div>
-              <div className="text-xs font-medium text-slate-600 pt-3 border-t border-slate-100 bg-slate-50 -mx-5 px-5 -mb-5 pb-5 rounded-b-2xl">
-                <div className="font-bold mb-1 text-slate-400 uppercase">Delivery Address</div>
-                {order.customerAddress}
-              </div>
             </div>
           ))
         )}
@@ -411,7 +506,7 @@ export default function MerchantClient({ merchant, globalAnnouncement }: { merch
   );
 
   const renderSettingsView = () => (
-    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="p-4 space-y-6 pb-28">
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="p-4 space-y-6 pb-36">
       
       {/* Store Status Toggle */}
       <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100 flex items-center justify-between">
@@ -537,13 +632,37 @@ export default function MerchantClient({ merchant, globalAnnouncement }: { merch
         {activeTab === "settings" && renderSettingsView()}
       </div>
 
+      {/* Real-time Order Notification */}
+      <AnimatePresence>
+        {showNotification && (
+          <motion.div 
+            initial={{ y: -100, opacity: 0 }} 
+            animate={{ y: 20, opacity: 1 }} 
+            exit={{ y: -100, opacity: 0 }} 
+            className="fixed top-0 left-0 right-0 z-50 flex justify-center px-4"
+          >
+            <div className="bg-green-600 text-white px-6 py-4 rounded-2xl shadow-2xl flex items-center space-x-3 max-w-sm w-full">
+              <div className="bg-white/20 p-2 rounded-full animate-bounce">
+                <BellRing className="w-6 h-6 text-white" />
+              </div>
+              <div>
+                <div className="font-black text-lg">New Order Arrived!</div>
+                <div className="text-sm font-medium text-green-100">Check your Orders tab</div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Bottom Navigation Bar */}
       <div className="fixed bottom-0 left-0 right-0 bg-white/90 backdrop-blur-xl border-t border-slate-100 px-6 py-3 pb-safe z-40 max-w-md mx-auto">
         <div className="flex justify-between items-center">
           <NavButton icon={<Home />} label="Home" isActive={activeTab === "home"} onClick={() => setActiveTab("home")} />
           <NavButton icon={<Receipt />} label="Orders" isActive={activeTab === "orders"} onClick={() => setActiveTab("orders")} />
           <NavButton icon={<Package />} label="Products" isActive={activeTab === "products"} onClick={() => setActiveTab("products")} />
-          <NavButton icon={<Settings />} label="Settings" isActive={activeTab === "settings"} onClick={() => setActiveTab("settings")} />
+          {role !== "STAFF" && (
+            <NavButton icon={<Settings />} label="Settings" isActive={activeTab === "settings"} onClick={() => setActiveTab("settings")} />
+          )}
         </div>
       </div>
 
@@ -587,6 +706,11 @@ export default function MerchantClient({ merchant, globalAnnouncement }: { merch
                     <input name="category" defaultValue={editingProduct?.category || "Uncategorized"} required type="text" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium" placeholder="Category" />
                     <input name="description" defaultValue={editingProduct?.description || ""} type="text" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium" placeholder="Description (Optional)" />
                     <input name="price" defaultValue={editingProduct?.price} required type="number" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium" placeholder="Base Price" />
+                    <label className="flex items-center space-x-2">
+                        <input type="checkbox" name="trackStock" defaultChecked={editingProduct?.trackStock} className="w-5 h-5 rounded text-indigo-600 focus:ring-indigo-500" />
+                        <span className="text-sm font-bold text-slate-700">Track Stock</span>
+                    </label>
+                    <input name="stockCount" defaultValue={editingProduct?.stockCount || 0} type="number" min="0" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium" placeholder="Stock Quantity" />
                   </div>
 
                   <button type="submit" disabled={loading} className="w-full bg-indigo-600 text-white py-4 rounded-xl font-bold text-lg hover:bg-indigo-700 transition-colors disabled:opacity-50">
@@ -640,12 +764,11 @@ export default function MerchantClient({ merchant, globalAnnouncement }: { merch
 
 function NavButton({ icon, label, isActive, onClick }: { icon: React.ReactNode, label: string, isActive: boolean, onClick: () => void }) {
   return (
-    <button onClick={onClick} className={`flex flex-col items-center justify-center w-16 h-12 relative transition-colors ${isActive ? 'text-indigo-600' : 'text-slate-400 hover:text-slate-600'}`}>
-      <div className="relative z-10 flex flex-col items-center">
+    <button onClick={onClick} className={`flex flex-col items-center justify-center w-[72px] h-16 relative transition-colors rounded-2xl ${isActive ? 'text-indigo-600 bg-indigo-50 shadow-sm' : 'text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}>
+      <div className="relative z-10 flex flex-col items-center justify-center space-y-1 [&>svg]:w-[22px] [&>svg]:h-[22px] [&>svg]:mb-1">
         {icon}
-        <span className="text-[10px] font-bold mt-1">{label}</span>
+        <span className="text-[10px] font-bold leading-none">{label}</span>
       </div>
-      {isActive && <motion.div layoutId="bottomNavBubble" className="absolute inset-0 bg-indigo-50 rounded-2xl -z-0" transition={{ type: "spring", bounce: 0.2, duration: 0.6 }} />}
     </button>
   );
 }

@@ -5,6 +5,7 @@ import { revalidatePath } from "next/cache";
 import { writeFile, mkdir } from "fs/promises";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
+import { login } from "./auth";
 
 // -- Admin Actions (Merchant Management) --
 
@@ -50,18 +51,21 @@ export async function deleteMerchant(id: string) {
   revalidatePath("/admin");
 }
 
-export async function updateMerchantSettings(id: string, formData: FormData) {
-  const name = formData.get("name") as string;
-  const phone = formData.get("phone") as string;
-  const theme = formData.get("theme") as string || "light";
-  const layout = formData.get("layout") as string || "grid";
-  
-  if (!name || !phone) return { error: "Name and phone are required" };
-
+export async function updateMerchantSettings(merchantId: string, data: FormData) {
   try {
+    const name = data.get("name") as string;
+    const phone = data.get("phone") as string;
+    const theme = data.get("theme") as string || "light";
+    const layout = data.get("layout") as string || "grid";
+    const deliveryFee = parseInt(data.get("deliveryFee") as string) || 0;
+    const freeDeliveryThresholdStr = data.get("freeDeliveryThreshold") as string;
+    const freeDeliveryThreshold = freeDeliveryThresholdStr ? parseInt(freeDeliveryThresholdStr) : null;
+
+    if (!name || !phone) return { error: "Name and phone are required" };
+
     await db.merchant.update({
-      where: { id },
-      data: { name, phone, theme, layout }
+      where: { id: merchantId },
+      data: { name, phone, theme, layout, deliveryFee, freeDeliveryThreshold }
     });
     revalidatePath("/merchant");
     revalidatePath("/admin");
@@ -85,6 +89,8 @@ export async function addProduct(merchantId: string, formData: FormData) {
   const price = parseFloat(formData.get("price") as string);
   const description = formData.get("description") as string;
   const category = formData.get("category") as string || "Uncategorized";
+  const trackStock = formData.get("trackStock") === "on";
+  const stockCount = parseInt(formData.get("stockCount") as string) || 0;
   const image = formData.get("image") as File;
 
   if (!name || isNaN(price) || !image || image.size === 0) {
@@ -114,14 +120,15 @@ export async function addProduct(merchantId: string, formData: FormData) {
         description,
         imageUrl,
         category,
-        merchantId
+        merchantId,
+        trackStock,
+        stockCount
       }
     });
 
     revalidatePath("/merchant");
     revalidatePath("/[storeSlug]", "page");
     return { success: true };
-
   } catch (error) {
     console.error(error);
     return { error: "Failed to upload product" };
@@ -133,13 +140,15 @@ export async function editProduct(id: string, formData: FormData) {
   const description = formData.get("description") as string;
   const price = parseFloat(formData.get("price") as string);
   const category = formData.get("category") as string || "Uncategorized";
+  const trackStock = formData.get("trackStock") === "on";
+  const stockCount = parseInt(formData.get("stockCount") as string) || 0;
   
   if (!name || isNaN(price)) return { error: "Name and valid price are required" };
 
   try {
     await db.product.update({
       where: { id },
-      data: { name, description, price, category }
+      data: { name, description, price, category, trackStock, stockCount }
     });
     revalidatePath("/merchant");
     revalidatePath("/[storeSlug]", "page");
@@ -164,23 +173,36 @@ export async function toggleStoreStatus(merchantId: string, currentStatus: boole
   revalidatePath("/[storeSlug]", "page");
 }
 
-export async function placeOrder(merchantId: string, customerName: string, customerAddress: string, totalAmount: number, items: {productName: string, quantity: number, price: number}[]) {
+export async function placeOrder(merchantId: string, orderData: { customerName: string, customerAddress: string, totalAmount: number, items: { id: string, name: string, quantity: number, price: number }[] }) {
   try {
     const order = await db.order.create({
       data: {
-        customerName,
-        customerAddress,
-        totalAmount,
         merchantId,
+        customerName: orderData.customerName,
+        customerAddress: orderData.customerAddress,
+        totalAmount: orderData.totalAmount,
         items: {
-          create: items.map(item => ({
-            productName: item.productName,
+          create: orderData.items.map(item => ({
+            productName: item.name,
             quantity: item.quantity,
             price: item.price
           }))
         }
       }
     });
+
+    // Decrement stock for tracked products
+    for (const item of orderData.items) {
+      const product = await db.product.findUnique({ where: { id: item.id } });
+      if (product && product.trackStock && product.stockCount > 0) {
+        await db.product.update({
+          where: { id: item.id },
+          data: { stockCount: Math.max(0, product.stockCount - item.quantity) }
+        });
+      }
+    }
+
+    revalidatePath("/merchant");
     return { success: true, orderId: order.id };
   } catch (error) {
     console.error(error);
@@ -286,3 +308,83 @@ export async function updateMerchantTier(merchantId: string, tier: string) {
   revalidatePath("/admin");
   revalidatePath("/merchant");
 }
+
+export async function authenticateMerchant(phone: string, pin: string) {
+  try {
+    // 1. Try Merchant (Admin)
+    const merchant = await db.merchant.findFirst({
+      where: { phone }
+    });
+    
+    if (merchant) {
+      if (merchant.pin !== pin) return { error: "Invalid PIN." };
+      await login(merchant.id, "ADMIN", merchant.id);
+      return { success: true };
+    }
+
+    // 2. Try Staff
+    const staff = await db.staff.findFirst({
+      where: { phone }
+    });
+
+    if (staff) {
+      if (staff.pin !== pin) return { error: "Invalid PIN." };
+      await login(staff.id, "STAFF", staff.merchantId);
+      return { success: true };
+    }
+    
+    return { error: "User not found with this phone number." };
+  } catch (error) {
+    console.error(error);
+    return { error: "Authentication failed." };
+  }
+}
+
+export async function signupMerchant(name: string, phone: string, pin: string) {
+  try {
+    const existing = await db.merchant.findFirst({
+      where: { phone }
+    });
+    
+    if (existing) return { error: "Phone number already registered." };
+
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
+    
+    // Check if slug exists, if so append random
+    let finalSlug = slug;
+    let count = 1;
+    while (await db.merchant.findUnique({ where: { slug: finalSlug } })) {
+      finalSlug = `${slug}-${count}`;
+      count++;
+    }
+
+    const merchant = await db.merchant.create({
+      data: {
+        name,
+        slug: finalSlug,
+        phone,
+        pin,
+      }
+    });
+
+    await login(merchant.id);
+    return { success: true };
+  } catch (error) {
+    console.error(error);
+    return { error: "Signup failed." };
+  }
+}
+
+export async function getMerchantOrders(merchantId: string) {
+  try {
+    const orders = await db.order.findMany({
+      where: { merchantId },
+      include: { items: true },
+      orderBy: { createdAt: 'desc' }
+    });
+    return { orders };
+  } catch (error) {
+    return { error: "Failed to fetch orders" };
+  }
+}
+

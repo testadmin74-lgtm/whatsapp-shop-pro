@@ -22,7 +22,7 @@ export default function MerchantLayout({ children }: { children: ReactNode }) {
               </p>
             </div>
           </div>
-          <button className="relative p-2 text-slate-400 hover:text-slate-600 transition-colors">
+          <button className="relative p-2 mr-2 text-slate-400 hover:text-slate-600 transition-colors">
             <Bell className="w-6 h-6" />
             <span className="absolute top-1 right-1 w-2.5 h-2.5 bg-red-500 border-2 border-white rounded-full"></span>
           </button>
