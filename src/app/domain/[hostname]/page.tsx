@@ -1,5 +1,5 @@
 import Storefront from "@/components/Storefront";
-import prisma from "@/lib/prisma";
+import { db as prisma } from "@/lib/db";
 import { notFound } from "next/navigation";
 
 export default async function CustomDomainPage({ params }: { params: { hostname: string } }) {
